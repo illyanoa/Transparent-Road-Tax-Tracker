@@ -12,12 +12,17 @@
 (define-constant err-project-not-funded (err u110))
 (define-constant err-invalid-milestone (err u111))
 (define-constant err-already-verified (err u112))
+(define-constant err-no-rewards-available (err u113))
+(define-constant err-reward-already-claimed (err u114))
+(define-constant err-invalid-reward-pool (err u115))
 
 (define-data-var total-pool-balance uint u0)
 (define-data-var next-project-id uint u1)
 (define-data-var tax-rate uint u100)
 (define-data-var next-milestone-id uint u1)
 (define-data-var total-completed-projects uint u0)
+(define-data-var reward-pool-balance uint u0)
+(define-data-var next-reward-pool-id uint u1)
 
 (define-map taxpayers principal uint)
 (define-map projects uint {
@@ -77,6 +82,22 @@
   impact-effectiveness: uint,
   community-approval: uint,
   total-ratings: uint
+})
+
+(define-map reward-pools uint {
+  pool-id: uint,
+  total-amount: uint,
+  remaining-amount: uint,
+  source: (string-ascii 64),
+  created-at: uint,
+  active: bool,
+  total-eligible-contributions: uint
+})
+
+(define-map reward-claims {pool-id: uint, claimer: principal} {
+  amount: uint,
+  claimed-at: uint,
+  taxpayer-contribution: uint
 })
 
 (define-public (pay-road-tax (amount uint))
@@ -307,6 +328,87 @@
   )
 )
 
+(define-public (create-reward-pool (amount uint) (source (string-ascii 64)))
+  (let ((pool-id (var-get next-reward-pool-id))
+        (current-pool (var-get total-pool-balance)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (<= amount current-pool) err-insufficient-funds)
+    
+    (var-set total-pool-balance (- current-pool amount))
+    (var-set reward-pool-balance (+ (var-get reward-pool-balance) amount))
+    
+    (map-set reward-pools pool-id {
+      pool-id: pool-id,
+      total-amount: amount,
+      remaining-amount: amount,
+      source: source,
+      created-at: stacks-block-height,
+      active: true,
+      total-eligible-contributions: (get-total-contributions)
+    })
+    
+    (var-set next-reward-pool-id (+ pool-id u1))
+    (ok pool-id)
+  )
+)
+
+(define-public (claim-reward (pool-id uint))
+  (let ((pool (unwrap! (map-get? reward-pools pool-id) err-invalid-reward-pool))
+        (taxpayer-contribution (default-to u0 (map-get? taxpayers tx-sender)))
+        (claim-key {pool-id: pool-id, claimer: tx-sender})
+        (existing-claim (map-get? reward-claims claim-key)))
+    (asserts! (> taxpayer-contribution u0) err-not-authorized)
+    (asserts! (get active pool) err-no-rewards-available)
+    (asserts! (is-none existing-claim) err-reward-already-claimed)
+    (asserts! (> (get remaining-amount pool) u0) err-no-rewards-available)
+    
+    (let ((reward-amount (/ (* (get total-amount pool) taxpayer-contribution) (get total-eligible-contributions pool))))
+      (asserts! (<= reward-amount (get remaining-amount pool)) err-insufficient-funds)
+      (asserts! (> reward-amount u0) err-invalid-amount)
+      
+      (try! (as-contract (stx-transfer? reward-amount tx-sender tx-sender)))
+      (var-set reward-pool-balance (- (var-get reward-pool-balance) reward-amount))
+      
+      (map-set reward-claims claim-key {
+        amount: reward-amount,
+        claimed-at: stacks-block-height,
+        taxpayer-contribution: taxpayer-contribution
+      })
+      
+      (map-set reward-pools pool-id (merge pool {
+        remaining-amount: (- (get remaining-amount pool) reward-amount)
+      }))
+      
+      (ok reward-amount)
+    )
+  )
+)
+
+(define-public (deactivate-reward-pool (pool-id uint))
+  (let ((pool (unwrap! (map-get? reward-pools pool-id) err-invalid-reward-pool)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (get active pool) err-no-rewards-available)
+    
+    (let ((remaining (get remaining-amount pool)))
+      (if (> remaining u0)
+        (begin
+          (var-set total-pool-balance (+ (var-get total-pool-balance) remaining))
+          (var-set reward-pool-balance (- (var-get reward-pool-balance) remaining))
+        )
+        true
+      )
+    )
+    
+    (map-set reward-pools pool-id (merge pool {
+      active: false,
+      remaining-amount: u0
+    }))
+    
+    (ok true)
+  )
+)
+
 (define-read-only (get-pool-balance)
   (var-get total-pool-balance)
 )
@@ -349,6 +451,8 @@
     tax-rate: (var-get tax-rate),
     total-completed-projects: (var-get total-completed-projects),
     next-milestone-id: (var-get next-milestone-id),
+    reward-pool-balance: (var-get reward-pool-balance),
+    next-reward-pool-id: (var-get next-reward-pool-id),
     owner: contract-owner,
     current-block: stacks-block-height
   }
@@ -456,5 +560,47 @@
                       u0),
     total-milestones: (- (var-get next-milestone-id) u1),
     average-community-satisfaction: (get-community-satisfaction-average)
+  }
+)
+
+(define-read-only (get-reward-pool (pool-id uint))
+  (map-get? reward-pools pool-id)
+)
+
+(define-read-only (get-reward-claim (pool-id uint) (claimer principal))
+  (map-get? reward-claims {pool-id: pool-id, claimer: claimer})
+)
+
+(define-read-only (calculate-claimable-reward (pool-id uint) (taxpayer principal))
+  (let ((pool (map-get? reward-pools pool-id))
+        (taxpayer-contribution (default-to u0 (map-get? taxpayers taxpayer))))
+    (match pool
+      pool-data
+        (if (and (get active pool-data) (> taxpayer-contribution u0))
+          (ok (/ (* (get total-amount pool-data) taxpayer-contribution) (get total-eligible-contributions pool-data)))
+          (ok u0)
+        )
+      (ok u0)
+    )
+  )
+)
+
+(define-read-only (has-claimed-reward (pool-id uint) (claimer principal))
+  (is-some (map-get? reward-claims {pool-id: pool-id, claimer: claimer}))
+)
+
+(define-read-only (get-total-contributions)
+  (fold + (map get-taxpayer-balance (list tx-sender)) u0)
+)
+
+(define-private (get-taxpayer-balance (taxpayer principal))
+  (default-to u0 (map-get? taxpayers taxpayer))
+)
+
+(define-read-only (get-reward-pool-analytics)
+  {
+    total-reward-pools: (- (var-get next-reward-pool-id) u1),
+    total-reward-balance: (var-get reward-pool-balance),
+    main-pool-balance: (var-get total-pool-balance)
   }
 )
